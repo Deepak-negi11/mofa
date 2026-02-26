@@ -322,9 +322,23 @@ impl<S: GraphState> CompiledGraphImpl<S> {
                     Some(EdgeTarget::Single(target)) => vec![target.clone()],
                     Some(EdgeTarget::Parallel(targets)) => targets.clone(),
                     Some(EdgeTarget::Conditional(routes)) => {
-                        // Find matching route based on state updates
+                        // Find matching route based on command.route
+                        if let Some(route_name) = &command.route {
+                            if let Some(target) = routes.get(route_name) {
+                                return vec![target.clone()];
+                            }
+                            warn!(
+                                "No conditional edge found for route '{}' from node '{}'",
+                                route_name, current_node
+                            );
+                        }
+                        // Legacy fallback: match update key names to route labels
                         for update in &command.updates {
                             if let Some(target) = routes.get(&update.key) {
+                                debug!(
+                                    "Legacy conditional routing via update key '{}' from node '{}'",
+                                    update.key, current_node
+                                );
                                 return vec![target.clone()];
                             }
                         }
@@ -483,9 +497,23 @@ impl<S: GraphState + 'static> CompiledGraph<S, serde_json::Value> for CompiledGr
                             Some(EdgeTarget::Single(target)) => vec![target.clone()],
                             Some(EdgeTarget::Parallel(targets)) => targets.clone(),
                             Some(EdgeTarget::Conditional(routes)) => {
-                                // Find matching route based on state updates
+                                // Find matching route based on command.route
+                                if let Some(route_name) = &command.route {
+                                    if let Some(target) = routes.get(route_name) {
+                                        return vec![target.clone()];
+                                    }
+                                    warn!(
+                                        "No conditional edge found for route '{}' from node '{}'",
+                                        route_name, current_node
+                                    );
+                                }
+                                // Legacy fallback: match update key names to route labels
                                 for update in &command.updates {
                                     if let Some(target) = routes.get(&update.key) {
+                                        debug!(
+                                            "Legacy conditional routing via update key '{}' from node '{}'",
+                                            update.key, current_node
+                                        );
                                         return vec![target.clone()];
                                     }
                                 }
@@ -709,6 +737,31 @@ mod tests {
         }
     }
 
+    struct RouteNode {
+        name: String,
+        updates: Vec<StateUpdate>,
+        route: String,
+    }
+
+    #[async_trait]
+    impl NodeFunc<JsonState> for RouteNode {
+        async fn call(
+            &self,
+            _state: &mut JsonState,
+            _ctx: &RuntimeContext,
+        ) -> AgentResult<Command> {
+            let mut cmd = Command::new();
+            for update in &self.updates {
+                cmd = cmd.update(update.key.clone(), update.value.clone());
+            }
+            Ok(cmd.with_route(self.route.clone()).continue_())
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
     #[tokio::test]
     async fn test_state_graph_build_and_compile() {
         let mut graph = StateGraphImpl::<JsonState>::new("test_graph");
@@ -779,5 +832,94 @@ mod tests {
         let final_state = result.unwrap();
         assert_eq!(final_state.get_value("processed"), Some(json!(true)));
         assert_eq!(final_state.get_value("count"), Some(json!(1)));
+    }
+
+    #[tokio::test]
+    async fn test_conditional_routing_uses_route_value_not_update_key() {
+        let mut graph = StateGraphImpl::<JsonState>::new("route_graph");
+
+        graph
+            .add_node(
+                "decide",
+                Box::new(RouteNode {
+                    name: "decide".to_string(),
+                    // This update key collides with a route label and should NOT control routing.
+                    updates: vec![StateUpdate::new("approve", json!(true))],
+                    route: "reject".to_string(),
+                }),
+            )
+            .add_node(
+                "approved",
+                Box::new(TestNode {
+                    name: "approved".to_string(),
+                    updates: vec![StateUpdate::new("decision", json!("approved"))],
+                }),
+            )
+            .add_node(
+                "rejected",
+                Box::new(TestNode {
+                    name: "rejected".to_string(),
+                    updates: vec![StateUpdate::new("decision", json!("rejected"))],
+                }),
+            )
+            .add_edge(START, "decide")
+            .add_conditional_edges(
+                "decide",
+                HashMap::from([
+                    ("approve".to_string(), "approved".to_string()),
+                    ("reject".to_string(), "rejected".to_string()),
+                ]),
+            )
+            .add_edge("approved", END)
+            .add_edge("rejected", END);
+
+        let compiled = graph.compile().unwrap();
+        let final_state = compiled.invoke(JsonState::new(), None).await.unwrap();
+
+        assert_eq!(final_state.get_value("decision"), Some(json!("rejected")));
+    }
+
+    #[tokio::test]
+    async fn test_conditional_routing_legacy_update_key_fallback() {
+        let mut graph = StateGraphImpl::<JsonState>::new("legacy_route_graph");
+
+        graph
+            .add_node(
+                "decide",
+                Box::new(TestNode {
+                    name: "decide".to_string(),
+                    // No explicit command.route; legacy update key fallback should select this route.
+                    updates: vec![StateUpdate::new("approve", json!(true))],
+                }),
+            )
+            .add_node(
+                "approved",
+                Box::new(TestNode {
+                    name: "approved".to_string(),
+                    updates: vec![StateUpdate::new("decision", json!("approved"))],
+                }),
+            )
+            .add_node(
+                "rejected",
+                Box::new(TestNode {
+                    name: "rejected".to_string(),
+                    updates: vec![StateUpdate::new("decision", json!("rejected"))],
+                }),
+            )
+            .add_edge(START, "decide")
+            .add_conditional_edges(
+                "decide",
+                HashMap::from([
+                    ("approve".to_string(), "approved".to_string()),
+                    ("reject".to_string(), "rejected".to_string()),
+                ]),
+            )
+            .add_edge("approved", END)
+            .add_edge("rejected", END);
+
+        let compiled = graph.compile().unwrap();
+        let final_state = compiled.invoke(JsonState::new(), None).await.unwrap();
+
+        assert_eq!(final_state.get_value("decision"), Some(json!("approved")));
     }
 }
